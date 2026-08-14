@@ -31,6 +31,8 @@ find_bytes
 find
 insn_query
 export_funcs
+nexus_export_semantic_candidate_facts
+make_signature_for_function
 callgraph
 
 # --- Composite analyses ---
