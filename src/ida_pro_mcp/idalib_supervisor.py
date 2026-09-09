@@ -228,10 +228,14 @@ class IdalibSupervisor:
         *,
         max_workers: int = 4,
         worker_args: list[str] | None = None,
+        allowed_roots: list[Path] | None = None,
     ):
         self.mcp = mcp
         self.max_workers = max_workers
         self.worker_args = worker_args or []
+        self.allowed_roots = tuple(
+            root.resolve() for root in (allowed_roots or [])
+        )
         self.sessions: dict[str, WorkerSession] = {}
         self.path_to_session: dict[str, str] = {}
         self._schema_worker: WorkerSession | None = None
@@ -260,13 +264,16 @@ class IdalibSupervisor:
             str(port),
             *self.worker_args,
         ]
+        for root in self.allowed_roots:
+            cmd.extend(["--allowed-root", str(root)])
         logger.info("Spawning idalib worker on 127.0.0.1:%d", port)
         # Detach so the worker survives this supervisor's exit: on Windows
         # spawn in a new process group; on Unix put it in its own session.
         creationflags = 0
         start_new_session = False
         if os.name == "nt":
-            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            creationflags = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                             | getattr(subprocess, "CREATE_NO_WINDOW", 0))
         else:
             start_new_session = True
         process = subprocess.Popen(
@@ -501,7 +508,35 @@ class IdalibSupervisor:
         path = Path(input_path)
         if not path.exists():
             raise FileNotFoundError(f"Input file not found: {input_path}")
-        return str(path.resolve())
+        resolved = path.resolve()
+        if self.allowed_roots and not any(
+            resolved == root or resolved.is_relative_to(root)
+            for root in self.allowed_roots
+        ):
+            raise PermissionError(
+                f"IDALIB_INPUT_OUTSIDE_ALLOWED_ROOT: {resolved}"
+            )
+        return str(resolved)
+
+    def _discover_project_instances(self) -> list[dict[str, Any]]:
+        instances = _discovery.discover_instances()
+        if not self.allowed_roots:
+            return instances
+        scoped: list[dict[str, Any]] = []
+        for instance in instances:
+            raw_path = str(instance.get("idb_path") or "")
+            if not raw_path:
+                continue
+            try:
+                resolved = Path(raw_path).resolve()
+            except (OSError, RuntimeError):
+                continue
+            if any(
+                resolved == root or resolved.is_relative_to(root)
+                for root in self.allowed_roots
+            ):
+                scoped.append(instance)
+        return scoped
 
     def _path_key(self, path: str) -> str:
         return os.path.normcase(str(Path(path).resolve()))
@@ -523,7 +558,7 @@ class IdalibSupervisor:
         that backend type."""
         candidates = self._candidate_idb_paths(resolved_path)
         try:
-            instances = _discovery.discover_instances()
+            instances = self._discover_project_instances()
         except Exception:
             logger.debug("Instance discovery failed", exc_info=True)
             return None
@@ -1165,7 +1200,7 @@ class IdalibSupervisor:
 
         unadopted: list[IdalibSessionListInfo] = []
         try:
-            instances = _discovery.discover_instances()
+            instances = self._discover_project_instances()
         except Exception:
             logger.debug("discover_instances failed during list_sessions", exc_info=True)
             instances = []
@@ -1279,6 +1314,25 @@ def _jsonrpc_error(request_id: Any, code: int, message: str) -> dict | None:
 
 
 @mcp.tool
+def supervisor_status() -> dict:
+    """Fast local status and cached capabilities; never start or probe an IDA worker."""
+    sup = _require_supervisor()
+    with sup._lock:
+        sessions = [
+            {"session_id": session.session_id, "filename": session.filename,
+             "backend": session.backend, "owned": session.owned}
+            for session in sup.sessions.values()
+        ]
+        # Cached names are diagnostic only; tool dispatch still enforces the profile.
+        cached_tools = sorted({tool["name"] for tools in sup._tools_cache.values()
+                               for tool in tools})
+        return {"max_workers": sup.max_workers, "sessions": sessions,
+                "session_count": len(sessions), "cached_tools": cached_tools,
+                "tools_cached": bool(sup._tools_cache),
+                "worker_probe_performed": False}
+
+
+@mcp.tool
 def idb_open(
     input_path: Annotated[str, "Path to the binary file to analyze"],
     mode: Annotated[
@@ -1370,7 +1424,7 @@ def _handle_tools_call(request_obj: dict[str, Any]) -> dict[str, Any] | None:
     tool_name = params.get("name", "")
     request_id = request_obj.get("id")
 
-    if tool_name in IDB_MANAGEMENT_TOOLS:
+    if tool_name in IDB_MANAGEMENT_TOOLS or tool_name == "supervisor_status":
         return _original_dispatch(request_obj)
 
     arguments = copy.deepcopy(params.get("arguments") or {})
@@ -1485,6 +1539,17 @@ def main() -> None:
         default=int(os.environ.get("IDA_MCP_MAX_WORKERS", "4")),
         help="Maximum simultaneous idalib worker databases (0 = unlimited, default: 4).",
     )
+    parser.add_argument(
+        "--allowed-root",
+        type=Path,
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=(
+            "Restrict opens and discovered worker adoption to this project root. "
+            "May be repeated."
+        ),
+    )
     parser.add_argument("input_path", type=Path, nargs="?", help="Optional binary to open on startup.")
     args = parser.parse_args()
 
@@ -1503,6 +1568,7 @@ def main() -> None:
         mcp,
         max_workers=args.max_workers,
         worker_args=worker_args,
+        allowed_roots=args.allowed_root,
     )
     mcp.registry.dispatch = dispatch_supervisor
 

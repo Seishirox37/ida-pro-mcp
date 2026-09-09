@@ -21,6 +21,7 @@ from ida_pro_mcp.ida_mcp.mainthread import get_pump
 from ida_pro_mcp.ida_mcp.profile import apply_profile, load_profile
 from ida_pro_mcp.ida_mcp.rpc import set_download_base_url, tool
 from ida_pro_mcp.idalib_session_manager import get_session_manager
+from ida_pro_mcp.path_policy import normalize_allowed_roots, resolve_allowed_path
 from ida_pro_mcp.worker_lifecycle import WorkerLifecycle
 
 
@@ -65,6 +66,7 @@ _PUMP = get_pump()
 _REGISTERED_PORT: int | None = None
 _BOUND_HOST: str = ""
 _BOUND_PORT: int = 0
+_ALLOWED_ROOTS: tuple[Path, ...] = ()
 
 
 def _register_in_discovery(host: str, port: int, input_path: Path) -> None:
@@ -128,7 +130,7 @@ def idb_open(
 
     try:
         manager = get_session_manager()
-        resolved_path = Path(input_path).resolve()
+        resolved_path = resolve_allowed_path(input_path, _ALLOWED_ROOTS)
         load_started_at = time.monotonic()
         opened_session_id = manager.open_binary(
             resolved_path,
@@ -214,6 +216,14 @@ def main():
         ),
     )
     parser.add_argument(
+        "--allowed-root",
+        type=Path,
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Restrict every opened database to this project root. May be repeated.",
+    )
+    parser.add_argument(
         "input_path",
         type=Path,
         nargs="?",
@@ -231,18 +241,19 @@ def main():
     logging.basicConfig(level=log_level)
     logging.getLogger().setLevel(log_level)
 
-    global _BOUND_HOST, _BOUND_PORT
+    global _BOUND_HOST, _BOUND_PORT, _ALLOWED_ROOTS
     _BOUND_HOST = args.host
     _BOUND_PORT = args.port
+    _ALLOWED_ROOTS = normalize_allowed_roots(args.allowed_root)
 
     session_manager = get_session_manager()
 
     if args.input_path is not None:
-        if not args.input_path.exists():
-            raise FileNotFoundError(f"Input file not found: {args.input_path}")
+        resolved = resolve_allowed_path(args.input_path, _ALLOWED_ROOTS)
+        if not resolved.exists():
+            raise FileNotFoundError(f"Input file not found: {resolved}")
 
-        logger.info("opening initial database: %s", args.input_path)
-        resolved = args.input_path.resolve()
+        logger.info("opening initial database: %s", resolved)
         session_id = session_manager.open_binary(resolved, run_auto_analysis=True)
         logger.info("Initial session created: %s", session_id)
         _register_in_discovery(args.host, args.port, resolved)

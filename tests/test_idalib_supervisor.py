@@ -131,6 +131,29 @@ def test_supervisor_import_does_not_import_ida_modules():
     assert "idaapi" not in sys.modules
 
 
+def test_spawn_worker_inherits_every_allowed_root(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        return _FakeProcess()
+
+    supervisor = supmod.IdalibSupervisor(
+        supmod.McpServer("test"),
+        max_workers=1,
+        allowed_roots=[tmp_path / "Nexus", tmp_path / "Nexus" / "fixtures"],
+    )
+    monkeypatch.setattr(supervisor, "_pick_port", lambda: 43123)
+    monkeypatch.setattr(supervisor, "_wait_worker_ready", lambda _worker: None)
+    monkeypatch.setattr(supmod.subprocess, "Popen", fake_popen)
+
+    supervisor._spawn_worker()
+
+    command = captured["command"]
+    roots = [command[index + 1] for index, token in enumerate(command) if token == "--allowed-root"]
+    assert roots == [str(root) for root in supervisor.allowed_roots]
+
+
 def test_worker_rpc_default_has_no_socket_timeout(monkeypatch):
     class _FakeResponse:
         status = 200
